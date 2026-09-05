@@ -25,8 +25,10 @@ import javax.inject.Singleton;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
@@ -38,6 +40,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.jar.JarEntry;
@@ -51,16 +54,19 @@ import org.apache.maven.artifact.handler.manager.ArtifactHandlerManager;
 import org.apache.maven.artifact.versioning.VersionRange;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Dependency;
+import org.apache.maven.model.DependencyManagement;
 import org.apache.maven.project.DefaultDependencyResolutionRequest;
 import org.apache.maven.project.DependencyResolutionException;
 import org.apache.maven.project.DependencyResolutionRequest;
-import org.apache.maven.project.DependencyResolutionResult;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.ProjectDependenciesResolver;
 import org.eclipse.aether.RepositorySystemSession;
 import org.eclipse.aether.graph.DependencyFilter;
 import org.eclipse.aether.graph.DependencyNode;
 import org.eclipse.aether.util.artifact.ArtifactIdUtils;
+import org.eclipse.aether.util.graph.transformer.ConflictResolver;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.Opcodes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -147,10 +153,17 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
             Set<Artifact> declaredArtifacts = buildDeclaredArtifacts(project, artifactHandlerManager);
             Set<Artifact> usedDeclaredArtifacts = new LinkedHashSet<>(declaredArtifacts);
             usedDeclaredArtifacts.retainAll(usedArtifacts.keySet());
+            Set<Artifact> unusedDeclaredArtifacts = removeAll(declaredArtifacts, usedArtifacts.keySet());
+            WrapperArtifactUsage wrapperUsage = findUsedDeclaredWrapperArtifacts(
+                    project, unusedDeclaredArtifacts, usedArtifacts, mainUsedArtifacts);
+            usedDeclaredArtifacts.addAll(wrapperUsage.usedArtifacts);
+
+            // A promoted wrapper has the same main/test usage classification as the dependency it supplies.
+            testOnlyArtifacts.addAll(removeAll(wrapperUsage.usedArtifacts, wrapperUsage.mainUsedArtifacts));
 
             Map<Artifact, Set<DependencyUsage>> usedDeclaredArtifactsWithClasses = new LinkedHashMap<>();
             for (Artifact a : usedDeclaredArtifacts) {
-                usedDeclaredArtifactsWithClasses.put(a, usedArtifacts.get(a));
+                usedDeclaredArtifactsWithClasses.put(a, usedArtifacts.getOrDefault(a, Collections.emptySet()));
             }
 
             Map<Artifact, Set<DependencyUsage>> usedUndeclaredArtifactsWithClasses = new LinkedHashMap<>(usedArtifacts);
@@ -159,8 +172,7 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
 
             usedUndeclaredArtifactsWithClasses.keySet().retainAll(usedUndeclaredArtifacts);
 
-            Set<Artifact> unusedDeclaredArtifacts = new LinkedHashSet<>(declaredArtifacts);
-            unusedDeclaredArtifacts = removeAll(unusedDeclaredArtifacts, usedArtifacts.keySet());
+            unusedDeclaredArtifacts = removeAll(unusedDeclaredArtifacts, usedDeclaredArtifacts);
 
             Set<Artifact> testArtifactsWithNonTestScope = getTestArtifactsWithNonTestScope(project, testOnlyArtifacts);
 
@@ -170,6 +182,306 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
         } catch (IOException exception) {
             throw new ProjectDependencyAnalyzerException("Cannot analyze dependencies", exception);
         }
+    }
+
+    /**
+     * Finds declared wrappers that supply a used dependency or override a transitive version.
+     *
+     * @param project project to analyze
+     * @param unusedDeclaredArtifacts unused declared artifacts
+     * @param usedArtifacts artifacts used by the project
+     * @return wrapper artifacts to treat as used
+     * @implNote Only wrappers required by detected class usage are promoted. Redundant wrappers and wrappers in
+     *     projects without detected usage remain unused.
+     */
+    Set<Artifact> getUsedDeclaredWrapperArtifacts(
+            MavenProject project,
+            Set<Artifact> unusedDeclaredArtifacts,
+            Map<Artifact, Set<DependencyUsage>> usedArtifacts) {
+        return findUsedDeclaredWrapperArtifacts(project, unusedDeclaredArtifacts, usedArtifacts, Collections.emptySet())
+                .usedArtifacts;
+    }
+
+    /** Finds used wrappers and records which ones serve main-code usage. */
+    private WrapperArtifactUsage findUsedDeclaredWrapperArtifacts(
+            MavenProject project,
+            Set<Artifact> unusedDeclaredArtifacts,
+            Map<Artifact, Set<DependencyUsage>> usedArtifacts,
+            Set<Artifact> mainUsedArtifacts) {
+        if (unusedDeclaredArtifacts.isEmpty() || usedArtifacts.isEmpty()) {
+            return new WrapperArtifactUsage();
+        }
+
+        RepositorySystemSession repositorySession = getRepositorySystemSession();
+        if (repositorySession == null) {
+            LOGGER.debug(
+                    "Cannot identify declared dependencies with used transitive dependencies without a repository session");
+            return new WrapperArtifactUsage();
+        }
+
+        // Only wrapper JARs without public API classes or service registrations are eligible for suppression.
+        List<Artifact> candidates = unusedDeclaredArtifacts.stream()
+                .filter(DefaultProjectDependencyAnalyzer::isWrapperJar)
+                .collect(Collectors.toList());
+        if (candidates.isEmpty()) {
+            return new WrapperArtifactUsage();
+        }
+        Set<String> usedDependencyIds = usedArtifacts.keySet().stream()
+                .map(DefaultProjectDependencyAnalyzer::toVersionlessId)
+                .collect(Collectors.toSet());
+        Set<String> mainUsedDependencyIds = mainUsedArtifacts.stream()
+                .map(DefaultProjectDependencyAnalyzer::toVersionlessId)
+                .collect(Collectors.toSet());
+        Set<String> candidateIds = candidates.stream()
+                .map(DefaultProjectDependencyAnalyzer::toVersionlessId)
+                .collect(Collectors.toSet());
+        Set<String> removableDependencyIds = unusedDeclaredArtifacts.stream()
+                .map(DefaultProjectDependencyAnalyzer::toVersionlessId)
+                .filter(dependencyId -> !candidateIds.contains(dependencyId))
+                .collect(Collectors.toSet());
+
+        // Exclude ordinary unused declarations that the final analysis also recommends removing.
+        List<Dependency> retainedDependencies = project.getDependencies().stream()
+                .filter(dependency -> !removableDependencyIds.contains(toResolverId(dependency)))
+                .collect(Collectors.toList());
+
+        Set<String> declaredDependencyIds =
+                project.getDependencies().stream().map(this::toResolverId).collect(Collectors.toSet());
+        // Model all used-undeclared recommendations at the versions actually analyzed.
+        List<Dependency> usedUndeclaredDependencies = usedArtifacts.keySet().stream()
+                .filter(artifact -> !declaredDependencyIds.contains(toVersionlessId(artifact)))
+                .map(artifact -> toModelDependency(project, artifact))
+                .collect(Collectors.toList());
+        if (!usedUndeclaredDependencies.isEmpty()) {
+            retainedDependencies = new ArrayList<>(retainedDependencies);
+            retainedDependencies.addAll(usedUndeclaredDependencies);
+        }
+
+        DependencyNode projectRoot;
+        try {
+            projectRoot = collectDependencyGraph(
+                    new DependencyGraphProject(project, retainedDependencies), repositorySession);
+        } catch (DependencyResolutionException exception) {
+            LOGGER.debug("Cannot identify declared wrapper dependencies", exception);
+            return new WrapperArtifactUsage();
+        }
+        if (projectRoot == null) {
+            return new WrapperArtifactUsage();
+        }
+        Map<String, org.eclipse.aether.artifact.Artifact> selectedArtifacts = getSelectedArtifacts(projectRoot);
+
+        WrapperArtifactUsage result = new WrapperArtifactUsage();
+        for (Artifact candidate : candidates) {
+            String candidateId = toVersionlessId(candidate);
+            try {
+                // Pin the isolated wrapper to the versions selected by the complete project.
+                List<Dependency> wrapperDependencies = retainedDependencies.stream()
+                        .filter(dependency -> candidateId.equals(toResolverId(dependency)))
+                        .collect(Collectors.toList());
+                DependencyNode wrapperRoot = collectDependencyGraph(
+                        createPinnedDependencyGraphProject(project, wrapperDependencies, selectedArtifacts),
+                        repositorySession);
+                Map<String, org.eclipse.aether.artifact.Artifact> wrapperArtifacts = getSelectedArtifacts(wrapperRoot);
+                boolean suppliesUsedDependency = wrapperRoot != null
+                        && wrapperRoot.getChildren().stream()
+                                .anyMatch(node -> hasUsedTransitiveDependency(node, usedDependencyIds));
+                boolean suppliesMainUsedDependency = wrapperRoot != null
+                        && wrapperRoot.getChildren().stream()
+                                .anyMatch(node -> hasUsedTransitiveDependency(node, mainUsedDependencyIds));
+                if (suppliesUsedDependency) {
+                    result.add(candidate, suppliesMainUsedDependency);
+                }
+                if (suppliesUsedDependency && (mainUsedDependencyIds.isEmpty() || suppliesMainUsedDependency)) {
+                    continue;
+                }
+
+                // Compare the retained dependency set so mutually redundant wrappers are not all discarded.
+                List<Dependency> otherDependencies = retainedDependencies.stream()
+                        .filter(dependency -> !candidateId.equals(toResolverId(dependency)))
+                        .collect(Collectors.toList());
+                DependencyNode alternativeRoot = collectDependencyGraph(
+                        new DependencyGraphProject(project, otherDependencies), repositorySession);
+                if (alternativeRoot == null) {
+                    continue;
+                }
+                Map<String, org.eclipse.aether.artifact.Artifact> alternativeSelectedArtifacts =
+                        getSelectedArtifacts(alternativeRoot);
+                Set<String> changedDependencyIds = getChangedSelectedDependencyIds(
+                        selectedArtifacts, alternativeSelectedArtifacts, wrapperArtifacts.keySet());
+                if (changedDependencyIds.isEmpty()) {
+                    if (!suppliesUsedDependency) {
+                        retainedDependencies = otherDependencies;
+                        selectedArtifacts = alternativeSelectedArtifacts;
+                    }
+                    continue;
+                }
+
+                boolean protectsUsedDependency = false;
+                boolean protectsMainUsedDependency = false;
+                // Isolate branches to retain duplicate paths while checking every version affected by the wrapper.
+                for (Dependency dependency : otherDependencies) {
+                    DependencyNode branchRoot = collectDependencyGraph(
+                            createPinnedDependencyGraphProject(
+                                    project, Collections.singletonList(dependency), alternativeSelectedArtifacts),
+                            repositorySession);
+                    if (branchRoot != null) {
+                        protectsUsedDependency |= branchRoot.getChildren().stream()
+                                .anyMatch(
+                                        node -> isUsedDependencyBranch(node, changedDependencyIds, usedDependencyIds));
+                        protectsMainUsedDependency |= branchRoot.getChildren().stream()
+                                .anyMatch(node ->
+                                        isUsedDependencyBranch(node, changedDependencyIds, mainUsedDependencyIds));
+                        if (protectsUsedDependency && (mainUsedDependencyIds.isEmpty() || protectsMainUsedDependency)) {
+                            break;
+                        }
+                    }
+                }
+                if (suppliesUsedDependency || protectsUsedDependency) {
+                    result.add(candidate, suppliesMainUsedDependency || protectsMainUsedDependency);
+                } else {
+                    retainedDependencies = otherDependencies;
+                    selectedArtifacts = alternativeSelectedArtifacts;
+                }
+            } catch (DependencyResolutionException exception) {
+                LOGGER.debug("Cannot identify whether declared dependency {} is a wrapper", candidate, exception);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Checks whether an artifact is a JAR without public classes or service registrations.
+     *
+     * @param artifact artifact to inspect
+     * @return whether the artifact is a wrapper JAR
+     */
+    private static boolean isWrapperJar(Artifact artifact) {
+        File file = artifact.getFile();
+        if (file == null || !file.isFile() || !file.getName().endsWith(".jar")) {
+            return false;
+        }
+
+        // Stop at the first public class, which is the common case for regular libraries.
+        try (JarFile jarFile = new JarFile(file)) {
+            Enumeration<JarEntry> jarEntries = jarFile.entries();
+            while (jarEntries.hasMoreElements()) {
+                JarEntry jarEntry = jarEntries.nextElement();
+                String name = jarEntry.getName();
+                // Service descriptors make an otherwise classless JAR behaviorally significant.
+                if (!jarEntry.isDirectory() && name.startsWith("META-INF/services/")) {
+                    return false;
+                }
+                int simpleNameStart = name.lastIndexOf('/') + 1;
+                String simpleName = name.substring(simpleNameStart);
+                // Descriptors do not constitute an externally accessible class API.
+                if (!jarEntry.isDirectory()
+                        && name.endsWith(".class")
+                        && !"module-info.class".equals(simpleName)
+                        && !"package-info.class".equals(simpleName)) {
+                    try (InputStream input = jarFile.getInputStream(jarEntry)) {
+                        if ((new ClassReader(input).getAccess() & Opcodes.ACC_PUBLIC) != 0) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        } catch (IOException | RuntimeException exception) {
+            LOGGER.debug("Cannot inspect dependency classes in {}", artifact, exception);
+            return false;
+        }
+    }
+
+    /**
+     * Checks whether a dependency subtree contains a used artifact.
+     *
+     * @param directDependency root of the dependency subtree
+     * @param usedDependencyIds used artifact identifiers
+     * @return whether the subtree contains a used artifact
+     */
+    private static boolean hasUsedTransitiveDependency(DependencyNode directDependency, Set<String> usedDependencyIds) {
+        // The isolated graph is already mediated to the versions selected for the complete project.
+        Deque<DependencyNode> remaining = new ArrayDeque<>(directDependency.getChildren());
+        Set<DependencyNode> visited = Collections.newSetFromMap(new IdentityHashMap<DependencyNode, Boolean>());
+        while (!remaining.isEmpty()) {
+            DependencyNode node = remaining.removeFirst();
+            if (visited.add(node)) {
+                if (node.getArtifact() != null
+                        && usedDependencyIds.contains(ArtifactIdUtils.toVersionlessId(node.getArtifact()))) {
+                    return true;
+                }
+                remaining.addAll(node.getChildren());
+            }
+        }
+        return false;
+    }
+
+    /** Checks whether an affected dependency descends from a used artifact. */
+    private static boolean isUsedDependencyBranch(
+            DependencyNode directDependency, Set<String> dependencyIds, Set<String> usedDependencyIds) {
+        Deque<DependencyPath> remaining = new ArrayDeque<>();
+        remaining.add(new DependencyPath(directDependency, false));
+        Set<DependencyNode> visitedWithoutUsage =
+                Collections.newSetFromMap(new IdentityHashMap<DependencyNode, Boolean>());
+        Set<DependencyNode> visitedWithUsage =
+                Collections.newSetFromMap(new IdentityHashMap<DependencyNode, Boolean>());
+        while (!remaining.isEmpty()) {
+            DependencyPath path = remaining.removeFirst();
+            DependencyNode node = path.node;
+            String dependencyId =
+                    node.getArtifact() != null ? ArtifactIdUtils.toVersionlessId(node.getArtifact()) : null;
+            boolean usedArtifactOnPath = path.usedArtifactOnPath || usedDependencyIds.contains(dependencyId);
+            Set<DependencyNode> visited = usedArtifactOnPath ? visitedWithUsage : visitedWithoutUsage;
+            if (!visited.add(node)) {
+                continue;
+            }
+            if (usedArtifactOnPath && dependencyIds.contains(dependencyId)) {
+                return true;
+            }
+            for (DependencyNode child : node.getChildren()) {
+                remaining.addLast(new DependencyPath(child, usedArtifactOnPath));
+            }
+        }
+        return false;
+    }
+
+    /** Returns wrapper descendants whose selected versions change without the wrapper. */
+    private static Set<String> getChangedSelectedDependencyIds(
+            Map<String, org.eclipse.aether.artifact.Artifact> selectedArtifacts,
+            Map<String, org.eclipse.aether.artifact.Artifact> alternativeSelectedArtifacts,
+            Set<String> wrapperArtifactIds) {
+        Set<String> changedDependencyIds = new LinkedHashSet<>();
+        for (String dependencyId : wrapperArtifactIds) {
+            org.eclipse.aether.artifact.Artifact selected = selectedArtifacts.get(dependencyId);
+            org.eclipse.aether.artifact.Artifact alternative = alternativeSelectedArtifacts.get(dependencyId);
+            if (selected != null
+                    && alternative != null
+                    && !Objects.equals(selected.getBaseVersion(), alternative.getBaseVersion())) {
+                changedDependencyIds.add(dependencyId);
+            }
+        }
+        return changedDependencyIds;
+    }
+
+    /** Collects the selected artifacts from a resolved graph. */
+    private static Map<String, org.eclipse.aether.artifact.Artifact> getSelectedArtifacts(DependencyNode root) {
+        Map<String, org.eclipse.aether.artifact.Artifact> artifacts = new LinkedHashMap<>();
+        if (root == null) {
+            return artifacts;
+        }
+        Deque<DependencyNode> remaining = new ArrayDeque<>(root.getChildren());
+        Set<DependencyNode> visited = Collections.newSetFromMap(new IdentityHashMap<DependencyNode, Boolean>());
+        while (!remaining.isEmpty()) {
+            DependencyNode node = remaining.removeFirst();
+            if (visited.add(node) && !node.getData().containsKey(ConflictResolver.NODE_DATA_WINNER)) {
+                // Discarded nodes and their subtrees do not contribute to the resolved dependency graph.
+                if (node.getArtifact() != null) {
+                    artifacts.put(ArtifactIdUtils.toVersionlessId(node.getArtifact()), node.getArtifact());
+                }
+                remaining.addAll(node.getChildren());
+            }
+        }
+        return artifacts;
     }
 
     /**
@@ -241,16 +553,12 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
 
     private Set<String> collectDependencyIds(MavenProject project, RepositorySystemSession repositorySession)
             throws DependencyResolutionException {
-        DependencyResolutionRequest request = new DefaultDependencyResolutionRequest(project, repositorySession);
-        request.setResolutionFilter(NO_ARTIFACT_RESOLUTION);
-        DependencyResolutionResult result = projectDependenciesResolver.resolve(request);
+        DependencyNode root = collectDependencyGraph(project, repositorySession);
 
         Set<String> dependencyIds = new HashSet<>();
-        DependencyNode root = result.getDependencyGraph();
         if (root == null) {
             return dependencyIds;
         }
-
         Deque<DependencyNode> remaining = new ArrayDeque<>(root.getChildren());
         Set<DependencyNode> visited = Collections.newSetFromMap(new IdentityHashMap<DependencyNode, Boolean>());
         while (!remaining.isEmpty()) {
@@ -265,6 +573,21 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
         return dependencyIds;
     }
 
+    /**
+     * Collects a dependency graph without resolving artifact files.
+     *
+     * @param project project whose graph to collect
+     * @param repositorySession repository session
+     * @return dependency graph root, possibly {@code null}
+     * @throws DependencyResolutionException if graph collection fails
+     */
+    private DependencyNode collectDependencyGraph(MavenProject project, RepositorySystemSession repositorySession)
+            throws DependencyResolutionException {
+        DependencyResolutionRequest request = new DefaultDependencyResolutionRequest(project, repositorySession);
+        request.setResolutionFilter(NO_ARTIFACT_RESOLUTION);
+        return projectDependenciesResolver.resolve(request).getDependencyGraph();
+    }
+
     private MavenProject createDependencyGraphProject(
             MavenProject project, Set<Artifact> candidates, NonTestClasspath classpath) {
         Set<String> candidateIds =
@@ -276,6 +599,44 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
         return new DependencyGraphProject(project, dependencies);
     }
 
+    /** Creates an isolated graph project pinned to already-selected versions. */
+    private MavenProject createPinnedDependencyGraphProject(
+            MavenProject project,
+            List<Dependency> dependencies,
+            Map<String, org.eclipse.aether.artifact.Artifact> selectedArtifacts) {
+        MavenProject graphProject = new DependencyGraphProject(project, dependencies);
+        DependencyManagement dependencyManagement = project.getDependencyManagement() != null
+                ? project.getDependencyManagement().clone()
+                : new DependencyManagement();
+        Set<String> managedIds = new HashSet<>();
+
+        // Retain existing management attributes while replacing only versions selected by the complete graph.
+        for (Dependency dependency : dependencyManagement.getDependencies()) {
+            String dependencyId = toResolverId(dependency);
+            org.eclipse.aether.artifact.Artifact selected = selectedArtifacts.get(dependencyId);
+            if (selected != null) {
+                dependency.setVersion(selected.getBaseVersion());
+            }
+            managedIds.add(dependencyId);
+        }
+        for (Map.Entry<String, org.eclipse.aether.artifact.Artifact> entry : selectedArtifacts.entrySet()) {
+            if (managedIds.add(entry.getKey())) {
+                org.eclipse.aether.artifact.Artifact selected = entry.getValue();
+                Dependency dependency = new Dependency();
+                dependency.setGroupId(selected.getGroupId());
+                dependency.setArtifactId(selected.getArtifactId());
+                dependency.setVersion(selected.getBaseVersion());
+                dependency.setType(selected.getExtension());
+                if (!selected.getClassifier().isEmpty()) {
+                    dependency.setClassifier(selected.getClassifier());
+                }
+                dependencyManagement.addDependency(dependency);
+            }
+        }
+        graphProject.getModel().setDependencyManagement(dependencyManagement);
+        return graphProject;
+    }
+
     private RepositorySystemSession getRepositorySystemSession() {
         MavenSession mavenSession = mavenSessionProvider != null ? mavenSessionProvider.get() : null;
         return mavenSession != null ? mavenSession.getRepositorySession() : null;
@@ -283,6 +644,21 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
 
     private String toDependencyConflictId(Dependency dependency) {
         return toDependencyConflictId(dependency, artifactHandlerManager.getArtifactHandler(dependency.getType()));
+    }
+
+    /** Returns the dependency identity used by Resolver. */
+    private String toResolverId(Dependency dependency) {
+        ArtifactHandler artifactHandler = artifactHandlerManager.getArtifactHandler(dependency.getType());
+        String extension = artifactHandler != null ? artifactHandler.getExtension() : null;
+        if (extension == null || extension.isEmpty()) {
+            extension = dependency.getType();
+        }
+        String classifier = dependency.getClassifier();
+        if (classifier == null && artifactHandler != null) {
+            classifier = artifactHandler.getClassifier();
+        }
+        return ArtifactIdUtils.toVersionlessId(
+                dependency.getGroupId(), dependency.getArtifactId(), extension, classifier);
     }
 
     private static String toDependencyConflictId(Dependency dependency, ArtifactHandler artifactHandler) {
@@ -300,6 +676,29 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
                 : artifact.getType();
         return ArtifactIdUtils.toVersionlessId(
                 artifact.getGroupId(), artifact.getArtifactId(), extension, artifact.getClassifier());
+    }
+
+    /** Converts a resolved artifact into an effective model dependency. */
+    private Dependency toModelDependency(MavenProject project, Artifact artifact) {
+        Dependency dependency = null;
+        if (project.getDependencyManagement() != null) {
+            dependency = project.getDependencyManagement().getDependencies().stream()
+                    .filter(managedDependency -> toVersionlessId(artifact).equals(toResolverId(managedDependency)))
+                    .findFirst()
+                    .map(Dependency::clone)
+                    .orElse(null);
+        }
+        if (dependency == null) {
+            dependency = new Dependency();
+        }
+        dependency.setGroupId(artifact.getGroupId());
+        dependency.setArtifactId(artifact.getArtifactId());
+        dependency.setVersion(artifact.getBaseVersion());
+        dependency.setScope(artifact.getScope());
+        dependency.setType(artifact.getType());
+        dependency.setClassifier(artifact.getClassifier());
+        dependency.setOptional(artifact.isOptional());
+        return dependency;
     }
 
     private enum NonTestClasspath {
@@ -425,6 +824,32 @@ public class DefaultProjectDependencyAnalyzer implements ProjectDependencyAnalyz
             // Make ProjectDependenciesResolver collect the filtered model dependencies while retaining all other
             // decorator-visible state copied by MavenProject(MavenProject).
             return null;
+        }
+    }
+
+    /** Wrapper artifacts promoted to used, split by main-code usage. */
+    private static final class WrapperArtifactUsage {
+        private final Set<Artifact> usedArtifacts = new LinkedHashSet<>();
+
+        private final Set<Artifact> mainUsedArtifacts = new LinkedHashSet<>();
+
+        private void add(Artifact artifact, boolean usedByMainCode) {
+            usedArtifacts.add(artifact);
+            if (usedByMainCode) {
+                mainUsedArtifacts.add(artifact);
+            }
+        }
+    }
+
+    /** A graph node together with whether its path contains a used artifact. */
+    private static final class DependencyPath {
+        private final DependencyNode node;
+
+        private final boolean usedArtifactOnPath;
+
+        private DependencyPath(DependencyNode node, boolean usedArtifactOnPath) {
+            this.node = node;
+            this.usedArtifactOnPath = usedArtifactOnPath;
         }
     }
 

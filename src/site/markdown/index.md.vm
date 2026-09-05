@@ -26,6 +26,11 @@ some cases are not detected including constants, annotations with source-only re
 and links in Javadoc. This can lead to incorrect results when these are the only uses
 of a dependency.
 
+Compatibility-wrapper dependencies without externally accessible classes are treated as used only
+when they supply an artifact referenced by detected bytecode or preserve a transitive version
+on a used dependency path.
+Redundant wrappers and wrappers in projects without detected class usage can still be reported as unused.
+
 The main component is `ProjectDependencyAnalyzer`
 ([javadoc](./apidocs/org/apache/maven/shared/dependency/analyzer/ProjectDependencyAnalyzer.html)), which uses
 `ClassAnalyzer`
